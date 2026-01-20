@@ -73,7 +73,25 @@ def generate_plan_local(stock_symbol: str, days: int):
         # 3. Clean
         df = components["validator"].clean_data(df)
         
-        # 4. Predict
+        # 4a. Market Context (Task 4)
+        # Fetch Nifty data to determine market regime
+        market_trend = "neutral"
+        try:
+            nifty_df, n_err = components["fetcher"].fetch("NIFTY", years=1) # "NIFTY" maps to ^NSEI
+            if not n_err and not nifty_df.empty:
+                 # Simple Trend: Price > SMA 50
+                 latest_nifty = nifty_df["Close"].iloc[-1]
+                 nifty_sma50 = nifty_df["Close"].rolling(window=50).mean().iloc[-1]
+                 
+                 if latest_nifty > nifty_sma50:
+                     market_trend = "bullish"
+                 else:
+                     market_trend = "bearish"
+        except Exception as e:
+            logger.warning(f"Failed to fetch Market Context: {e}")
+
+        
+        # 4b. Predict
         # Check model availability first
         pred = components["predictor"]
         if not pred.is_model_available(days):
@@ -91,7 +109,8 @@ def generate_plan_local(stock_symbol: str, days: int):
         plan = components["rules"].evaluate(
             ml_output=ml_output,
             horizon=days,
-            latest_price=ml_output["latest_close"]
+            latest_price=ml_output["latest_close"],
+            market_trend=market_trend
         )
         
         # 6. Explain
@@ -119,6 +138,8 @@ def generate_plan_local(stock_symbol: str, days: int):
             "ml_trend": plan.ml_trend,
             "timestamp": datetime.now().isoformat(),
             "warnings": plan.warnings,
+            "market_trend": market_trend,
+            "position_size": plan.position_size_multiplier,
         }, None
         
     except Exception as e:
@@ -146,10 +167,18 @@ def render_header():
 def render_metrics(result):
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Risk/Reward", f"{result['risk_reward_ratio']}:1")
-    c2.metric("Position Risk", f"{result['position_risk_pct']}%")
+    
+    # Position Size Metric
+    size_mult = result.get('position_size', 1.0)
+    size_str = "100%" if size_mult == 1.0 else f"{int(size_mult*100)}%"
+    c2.metric("Position Size", size_str, help="Recommended position size based on risk tier")
+    
     c3.metric("ML Prob", f"{result['ml_probability']*100:.1f}%")
-    trend_icon = "🟢" if result['ml_trend'] == 'bullish' else "🔴"
-    c4.metric("Trend", f"{trend_icon} {result['ml_trend']}")
+    
+    # Market Trend Metric
+    m_trend = result.get('market_trend', 'neutral')
+    m_icon = "🟢" if m_trend == 'bullish' else ("🔴" if m_trend == 'bearish' else "⚪")
+    c4.metric("Market", f"{m_icon} {m_trend.title()}")
 
 def main():
     render_header()

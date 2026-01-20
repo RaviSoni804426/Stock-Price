@@ -50,6 +50,7 @@ class TradingPlan:
     ml_probability: float
     ml_trend: str
     ml_expected_move: float
+    position_size_multiplier: float = 1.0 # Default 1.0x
     
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -61,11 +62,11 @@ class RulesEngine:
     Deterministic rules engine for trading decisions.
     
     Rules:
-    1. Probability < 0.55 → AVOID
-    2. Price below SMA 50 → AVOID (unless strong bullish signal)
-    3. RSI > 80 (overbought) → AVOID or reduce confidence
-    4. RSI < 20 (oversold) → Potential bounce, consider context
-    5. Risk per trade ≤ 1.5%
+    1. Probability < 0.60 → AVOID
+    2. Probability 0.60-0.70 → Calculated Risk (0.5x size)
+    3. Probability >= 0.70 → High Conviction (1.0x size)
+    4. RSI > 80 → Avoid or reduce
+    5. Volatility Scaling
     
     Computes:
     - Entry price (current price or slight improvement)
@@ -86,7 +87,8 @@ class RulesEngine:
         self, 
         ml_output: Dict,
         horizon: int,
-        latest_price: float
+        latest_price: float,
+        market_trend: str = "neutral"
     ) -> TradingPlan:
         """
         Evaluate ML output and generate trading plan.
@@ -95,6 +97,7 @@ class RulesEngine:
             ml_output: Dictionary from StockPredictor.predict()
             horizon: Trading horizon in days
             latest_price: Current stock price
+            market_trend: 'bullish', 'bearish', or 'neutral'
             
         Returns:
             TradingPlan with decision and price levels
@@ -107,58 +110,99 @@ class RulesEngine:
         reasons = []
         warnings = []
         
-        # Initialize decision as BUY
+        # Initialize decision and multiplier
         decision = Decision.BUY
         confidence = self._calculate_base_confidence(probability)
+        position_size_multiplier = 0.0
+
+        # Task 2 & 3: Probability-Based Risk Zones & Position Sizing
+        # ------------------------------------------------------------------
+        # High Conviction: Prob >= 0.70 (1.0x Position)
+        # Calculated Risk: Prob 0.60-0.70 (0.5x Position)
+        # Avoid: Prob < 0.60 (0.0x Position)
         
-        # Rule 1: Probability threshold
-        min_prob = self.config["min_probability"]
-        if probability < min_prob:
-            decision = Decision.AVOID
-            reasons.append(f"Model probability ({probability:.1%}) below threshold ({min_prob:.1%})")
-            confidence = int(probability * 100)
+        zone = "AVOID"
+        
+        # Rule 1: Probability Zones
+        if probability >= 0.70:
+            zone = "HIGH_CONVICTION"
+            decision = Decision.BUY
+            position_size_multiplier = 1.0
+            reasons.append(f"High Conviction Signal (Prob {probability:.1%})")
+            confidence = 80 + int((probability - 0.70) * 100) # 80-90+
+            
+        elif probability >= 0.60:
+            zone = "CALCULATED_RISK"
+            decision = Decision.BUY
+            position_size_multiplier = 0.5
+            reasons.append(f"Calculated Risk Signal (Prob {probability:.1%})")
+            warnings.append("Medium conviction - consider half position size")
+            confidence = 60 + int((probability - 0.60) * 100) # 60-70
+            
         else:
-            reasons.append(f"Model probability ({probability:.1%}) above threshold")
-        
-        # Rule 2: Price relative to SMA 50
+            zone = "AVOID"
+            decision = Decision.AVOID
+            position_size_multiplier = 0.0
+            reasons.append(f"Low Probability ({probability:.1%}) - AVOID")
+            confidence = int(probability * 100)
+            
+        # Task 4: Market Regime Filter
+        # ----------------------------
+        if market_trend == "bearish":
+            if zone == "CALCULATED_RISK":
+                decision = Decision.AVOID
+                zone = "AVOID (Market Regime)"
+                position_size_multiplier = 0.0
+                reasons.append("Bearish Market Regime invalidates Calculated Risk trade")
+            elif zone == "HIGH_CONVICTION":
+                 warnings.append("Trading against Bearish Market Trend")
+                 confidence -= 10
+
+        # Rule 2: Price relative to SMA 50 (Filter)
+        # In Calculated Risk zone, SMA check is stricter
         above_sma_50 = features.get("above_sma_50", True)
-        price_to_sma = features.get("price_to_sma_50_pct", 0)
         
         if not above_sma_50:
-            if probability < 0.60:  # Need stronger signal when below SMA
-                decision = Decision.AVOID
-                reasons.append(f"Price below SMA 50 ({price_to_sma:.1f}% deviation)")
-                confidence = min(confidence, 40)
-            else:
-                warnings.append(f"Price below SMA 50 - higher risk")
-                confidence = min(confidence, 55)
+            if zone == "CALCULATED_RISK":
+                 # Downgrade Calculated Risk to Avoid if below SMA
+                 decision = Decision.AVOID
+                 zone = "AVOID (SMA Filter)"
+                 position_size_multiplier = 0.0
+                 reasons.append("Price below SMA 50 invalidates Calculated Risk trade")
+            elif zone == "HIGH_CONVICTION":
+                 warnings.append("Price below SMA 50 - Counter-trend trade")
+                 confidence -= 10 # Penalty
         
         # Rule 3: RSI analysis
         rsi = features.get("rsi", 50)
         
         if rsi > 80:
-            warnings.append(f"RSI overbought ({rsi:.1f}) - potential reversal risk")
-            confidence = min(confidence, 50)
-            if probability < 0.60:
-                decision = Decision.AVOID
-                reasons.append(f"RSI overbought ({rsi:.1f}) with moderate probability")
-        elif rsi < 20:
-            warnings.append(f"RSI oversold ({rsi:.1f}) - potential bounce")
-            # Don't automatically change decision, but note it
+             if zone == "CALCULATED_RISK":
+                 decision = Decision.AVOID
+                 reasons.append("RSI Overbought (>80) invalidates weak signal")
+                 position_size_multiplier = 0.0
+             else:
+                 warnings.append(f"RSI overbought ({rsi:.1f}) - risk of pullback")
         
         # Rule 4: Volatility check
         volatility = features.get("volatility", 20)
-        if volatility > 50:  # High volatility
-            warnings.append(f"High volatility ({volatility:.1f}%) - increased risk")
-            confidence = min(confidence, confidence - 5)
-        
+        if volatility > 50:
+            warnings.append(f"Extreme Volatility ({volatility:.1f}%) - cutting position size")
+            position_size_multiplier *= 0.75 # 25% reduction capability (Task 5)
+
         # Rule 5: Trend alignment
         if trend == "bearish":
             if decision == Decision.BUY:
-                decision = Decision.AVOID
-                reasons.append(f"Bearish trend signal")
+                 # Only High Conviction survives bearish trend, but with reduced confidence
+                 if zone == "HIGH_CONVICTION":
+                      warnings.append("Trading against Bearish ML Trend")
+                      confidence -= 15
+                 else:
+                      decision = Decision.AVOID
+                      reasons.append("Bearish ML Trend invalidates signal")
+                      position_size_multiplier = 0.0
         elif trend == "bullish":
-            reasons.append(f"Bullish trend alignment")
+            reasons.append("Aligned with Bullish ML Trend")
         
         # Calculate price levels
         entry_price, stop_loss, target_price = self._calculate_price_levels(
@@ -195,6 +239,7 @@ class RulesEngine:
             ml_probability=probability,
             ml_trend=trend,
             ml_expected_move=expected_move,
+            position_size_multiplier=round(position_size_multiplier, 2),
         )
         
         logger.info(f"Rules evaluation: {decision.value} with {confidence}% confidence")

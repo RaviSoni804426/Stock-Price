@@ -262,12 +262,36 @@ def train_model(
     logger.info(f"\n{'='*50}")
     logger.info(f"Model Performance for {horizon}-day horizon:")
     logger.info(f"{'='*50}")
-    logger.info(f"Accuracy:  {metrics['accuracy']:.4f}")
-    logger.info(f"Precision: {metrics['precision']:.4f}")
-    logger.info(f"Recall:    {metrics['recall']:.4f}")
-    logger.info(f"F1 Score:  {metrics['f1']:.4f}")
-    logger.info(f"ROC-AUC:   {metrics['roc_auc']:.4f}")
+    
+    # Task 1: Reset Success Metrics
+    # Prioritize Precision, Recall, and Business Metrics
+    
+    # Calculate approx "Profit Factor" via counts
+    # Wins = True Positives, Losses = False Positives (Assuming every buy signal is taken)
+    # Using simplistic Target/StopLoss ratio from Config (avg ~2.5 R:R) helps estimate "Profitability"
+    tp = np.sum((y_test == 1) & (y_pred == 1))
+    fp = np.sum((y_test == 0) & (y_pred == 1))
+    
+    # Fetch risk-reward ratio from Config (default 2.5 if missing)
+    avg_win_size = TARGET_THRESHOLDS.get(horizon, 3.5) 
+    avg_loss_size = 2.0 # Default stop loss
+    
+    gross_profit = tp * avg_win_size
+    gross_loss = fp * avg_loss_size
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+
+    logger.info(f"precision (BUY Accuracy): {metrics['precision']:.4f}")
+    logger.info(f"recall (Opportunity Capture): {metrics['recall']:.4f}")
+    logger.info(f"profit_factor (Est.): {profit_factor:.2f}")
+    logger.info(f"f1_score:  {metrics['f1']:.4f}")
+    logger.info(f"roc_auc:   {metrics['roc_auc']:.4f}")
+    
+    logger.info(f"TP: {tp} | FP: {fp} (Signal Ratio)")
     logger.info(f"CV ROC-AUC: {metrics['cv_roc_auc_mean']:.4f} (+/- {metrics['cv_roc_auc_std']:.4f})")
+    
+    if metrics['precision'] < 0.50:
+         logger.warning("⚠️  Precision < 50% - Strategies based on this model may lose money without filters.")
+         
     logger.info(f"{'='*50}\n")
     
     # Feature importance
