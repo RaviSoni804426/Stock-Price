@@ -17,7 +17,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           # ⚠️ CHANGE THESE TO YOUR HUGGING FACE DETAILS
-          HF_USERNAME: "RaviSoni804426"  # Replace if your HF username is different
+          HF_USERNAME: "RaviSonii"  # Replace if your HF username is different
           SPACE_NAME: "stock-decision-assistant" # Replace with your exact Space name
         run: |
           git push --force https://$HF_USERNAME:$HF_TOKEN@huggingface.co/spaces/$HF_USERNAME/$SPACE_NAME main
